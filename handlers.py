@@ -1,12 +1,13 @@
 import logging
-from telethon import TelegramClient
+from telethon import events, TelegramClient
 from telethon.errors import SessionPasswordNeededError
+from telethon.sessions import StringSession
 from config import Config
 from db import Database
 
 logger = logging.getLogger(__name__)
 
-# ── Multi-step command state storage ────────────────────────────
+# ── Multi-step state storage ────────────────────────────────────
 _states: dict[int, dict] = {}
 
 
@@ -22,33 +23,14 @@ def _clear(uid: int):
     _states.pop(uid, None)
 
 
-# ── Helpers ─────────────────────────────────────────────────────
-def _admin_only(func):
-    """Decorator: only admins may execute."""
-    async def wrapper(event, *a, **kw):
-        db: Database = kw.get("db")
-        if db and not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
-        return await func(event, *a, **kw)
-    return wrapper
-
-
-def _require_userbot(func):
-    """Decorator: requires an active userbot client."""
-    async def wrapper(event, *a, **kw):
-        ub = kw.get("userbot")
-        if not ub:
-            return await event.reply("❌ Userbot is not connected.\nSet `SESSION_STRING` and restart.")
-        return await func(event, *a, **kw)
-    return wrapper
-
-
 # ── Register all handlers ───────────────────────────────────────
 def register_handlers(bot: TelegramClient, userbot, db: Database):
+
     # ---- /start ----
-    @bot.on("/start")
-    @_admin_only
-    async def cmd_start(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/start(?!\S)"))
+    async def cmd_start(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         await event.reply(
             "👋 **Welcome to AutoPost Bot**\n\n"
             "Use /help to see all commands.\n\n"
@@ -56,9 +38,10 @@ def register_handlers(bot: TelegramClient, userbot, db: Database):
         )
 
     # ---- /help ----
-    @bot.on("/help")
-    @_admin_only
-    async def cmd_help(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/help(?!\S)"))
+    async def cmd_help(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         await event.reply(
             "📖 **Commands**\n\n"
             "🔧 **Setup**\n"
@@ -82,9 +65,10 @@ def register_handlers(bot: TelegramClient, userbot, db: Database):
         )
 
     # ---- /gensession ----
-    @bot.on("/gensession")
-    @_admin_only
-    async def cmd_gensession(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/gensession(?!\S)"))
+    async def cmd_gensession(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         if Config.SESSION_STRING:
             return await event.reply("⚠️ Session string is already configured.")
         await event.reply(
@@ -95,10 +79,14 @@ def register_handlers(bot: TelegramClient, userbot, db: Database):
         _set(event.sender_id, {"cmd": "gensession", "step": "phone"})
 
     # ---- /setsource ----
-    @bot.on("/setsource")
-    @_admin_only
-    @_require_userbot
-    async def cmd_setsource(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/setsource(?!\S)"))
+    async def cmd_setsource(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
+        if not userbot:
+            return await event.reply(
+                "❌ Userbot is not connected.\nSet `SESSION_STRING` and restart."
+            )
         await event.reply(
             "📌 **Set Source Channel**\n\n"
             "Send the channel username or ID:\n"
@@ -107,10 +95,14 @@ def register_handlers(bot: TelegramClient, userbot, db: Database):
         _set(event.sender_id, {"cmd": "setsource"})
 
     # ---- /addchannel ----
-    @bot.on("/addchannel")
-    @_admin_only
-    @_require_userbot
-    async def cmd_addchannel(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/addchannel(?!\S)"))
+    async def cmd_addchannel(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
+        if not userbot:
+            return await event.reply(
+                "❌ Userbot is not connected.\nSet `SESSION_STRING` and restart."
+            )
         await event.reply(
             "➕ **Add Destination Channel**\n\n"
             "Send the channel username or ID:\n"
@@ -119,58 +111,74 @@ def register_handlers(bot: TelegramClient, userbot, db: Database):
         _set(event.sender_id, {"cmd": "addchannel"})
 
     # ---- /removechannel ----
-    @bot.on("/removechannel")
-    @_admin_only
-    async def cmd_removechannel(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/removechannel(?!\S)"))
+    async def cmd_removechannel(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         channels = await db.get_all_channels()
         if not channels:
             return await event.reply("❌ No channels added yet.")
         lines = []
         for i, ch in enumerate(channels, 1):
-            lines.append(f"{i}. {ch.get('channel_name', ch['channel_id'])} (`{ch['channel_id']}`)")
+            lines.append(
+                f"{i}. {ch.get('channel_name', ch['channel_id'])} "
+                f"(`{ch['channel_id']}`)"
+            )
         await event.reply(
-            "➖ **Remove Channel**\n\nSend the channel ID to remove:\n\n" + "\n".join(lines)
+            "➖ **Remove Channel**\n\n"
+            "Send the channel ID to remove:\n\n" + "\n".join(lines)
         )
         _set(event.sender_id, {"cmd": "removechannel"})
 
     # ---- /addadmin ----
-    @bot.on("/addadmin")
-    @_admin_only
-    async def cmd_addadmin(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/addadmin(?!\S)"))
+    async def cmd_addadmin(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         await event.reply("👤 Send the **user ID** to add as admin:")
         _set(event.sender_id, {"cmd": "addadmin"})
 
     # ---- /removeadmin ----
-    @bot.on("/removeadmin")
-    @_admin_only
-    async def cmd_removeadmin(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/removeadmin(?!\S)"))
+    async def cmd_removeadmin(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         admins = await db.get_admins()
-        lines = [f"• `{a['user_id']}` — {a.get('name', 'Admin')}" for a in admins]
+        lines = [
+            f"• `{a['user_id']}` — {a.get('name', 'Admin')}" for a in admins
+        ]
         await event.reply(
-            "🗑 **Remove Admin**\n\nSend the user ID to remove:\n\n" + "\n".join(lines)
+            "🗑 **Remove Admin**\n\n"
+            "Send the user ID to remove:\n\n" + "\n".join(lines)
         )
         _set(event.sender_id, {"cmd": "removeadmin"})
 
     # ---- /setlimit ----
-    @bot.on("/setlimit")
-    @_admin_only
-    async def cmd_setlimit(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/setlimit(?!\S)"))
+    async def cmd_setlimit(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         channels = await db.get_all_channels()
         if not channels:
             return await event.reply("❌ No channels added.")
         lines = []
         for ch in channels:
             lim = ch.get("daily_limit", 50)
-            lines.append(f"• {ch.get('channel_name', ch['channel_id'])} (`{ch['channel_id']}`) — current: {lim}")
+            lines.append(
+                f"• {ch.get('channel_name', ch['channel_id'])} "
+                f"(`{ch['channel_id']}`) — current: {lim}"
+            )
         await event.reply(
-            "🔢 **Set Daily Limit**\n\nSend in format:\n`channel_id limit`\n\n" + "\n".join(lines)
+            "🔢 **Set Daily Limit**\n\n"
+            "Send in format: `channel_id limit`\n\n" + "\n".join(lines)
         )
         _set(event.sender_id, {"cmd": "setlimit"})
 
     # ---- /settime ----
-    @bot.on("/settime")
-    @_admin_only
-    async def cmd_settime(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/settime(?!\S)"))
+    async def cmd_settime(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         await event.reply(
             "⏱ **Set Posting Time Window**\n\n"
             "Send in format: `start-end` (hours, 0-23)\n"
@@ -180,9 +188,10 @@ def register_handlers(bot: TelegramClient, userbot, db: Database):
         _set(event.sender_id, {"cmd": "settime"})
 
     # ---- /setfooter ----
-    @bot.on("/setfooter")
-    @_admin_only
-    async def cmd_setfooter(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/setfooter(?!\S)"))
+    async def cmd_setfooter(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         await event.reply(
             "✏️ **Set Caption Footer**\n\n"
             "Send the footer text to append to every post.\n"
@@ -191,9 +200,10 @@ def register_handlers(bot: TelegramClient, userbot, db: Database):
         _set(event.sender_id, {"cmd": "setfooter"})
 
     # ---- /setmode ----
-    @bot.on("/setmode")
-    @_admin_only
-    async def cmd_setmode(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/setmode(?!\S)"))
+    async def cmd_setmode(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         await event.reply(
             "📋 **Set Posting Mode**\n\n"
             "Send one of:\n"
@@ -204,9 +214,10 @@ def register_handlers(bot: TelegramClient, userbot, db: Database):
         _set(event.sender_id, {"cmd": "setmode"})
 
     # ---- /setlink ----
-    @bot.on("/setlink")
-    @_admin_only
-    async def cmd_setlink(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/setlink(?!\S)"))
+    async def cmd_setlink(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         await event.reply(
             "🔗 **Set Link Handling**\n\n"
             "Send one of:\n"
@@ -214,26 +225,29 @@ def register_handlers(bot: TelegramClient, userbot, db: Database):
             "`remove` — Remove t.me links\n"
             "`replace` — Replace t.me links (you'll be asked for URL)"
         )
-        _set(event.sender_id, {"cmd": "setlink"})
+        _set(event.sender_id, {"cmd": "setlink", "step": "mode"})
 
     # ---- /pause ----
-    @bot.on("/pause")
-    @_admin_only
-    async def cmd_pause(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/pause(?!\S)"))
+    async def cmd_pause(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         await db.update_settings({"is_paused": True})
         await event.reply("⏸ Posting **paused**.")
 
     # ---- /resume ----
-    @bot.on("/resume")
-    @_admin_only
-    async def cmd_resume(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/resume(?!\S)"))
+    async def cmd_resume(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         await db.update_settings({"is_paused": False})
         await event.reply("▶️ Posting **resumed**.")
 
     # ---- /status ----
-    @bot.on("/status")
-    @_admin_only
-    async def cmd_status(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/status(?!\S)"))
+    async def cmd_status(event):
+        if not await db.is_admin(event.sender_id):
+            return await event.reply("❌ You are not authorized.")
         s = await db.get_settings()
         channels = await db.get_all_channels()
         tracking = {}
@@ -251,7 +265,11 @@ def register_handlers(bot: TelegramClient, userbot, db: Database):
         t_end = s.get("time_end")
 
         status_icon = "⏸ Paused" if paused else "▶️ Running"
-        time_str = f"{t_start}:00 — {t_end}:00" if t_start is not None else "Always"
+        time_str = (
+            f"{t_start}:00 — {t_end}:00"
+            if t_start is not None
+            else "Always"
+        )
         src_name = s.get("source_name", "Not set")
 
         lines = [
@@ -267,8 +285,12 @@ def register_handlers(bot: TelegramClient, userbot, db: Database):
         ]
 
         if tracking:
-            lines.append(f"🔸 **Pointer**: {tracking.get('current_id', '?')}")
-            lines.append(f"🔸 **Start ID**: {tracking.get('start_id', '?')}")
+            lines.append(
+                f"🔸 **Pointer**: {tracking.get('current_id', '?')}"
+            )
+            lines.append(
+                f"🔸 **Start ID**: {tracking.get('start_id', '?')}"
+            )
 
         if channels:
             lines.append("\n📋 **Channel Limits**:")
@@ -281,13 +303,22 @@ def register_handlers(bot: TelegramClient, userbot, db: Database):
         await event.reply("\n".join(lines))
 
     # ---- /cancel ----
-    @bot.on("/cancel")
-    async def cmd_cancel(event, **_):
+    @bot.on(events.NewMessage(pattern=r"/cancel(?!\S)"))
+    async def cmd_cancel(event):
         _clear(event.sender_id)
         await event.reply("✅ Operation cancelled.")
 
-    # ── Generic message handler (multi-step flows) ─────────────
-    @bot.on(lambda e: e.is_private and e.text and not e.text.startswith("/"))
+    # ── Generic private message handler (multi-step flows) ─────
+    @bot.on(
+        events.NewMessage(
+            incoming=True,
+            func=lambda e: (
+                e.is_private
+                and bool(e.text)
+                and not e.text.startswith("/")
+            ),
+        )
+    )
     async def on_private_message(event):
         uid = event.sender_id
         state = _get(uid)
@@ -336,9 +367,10 @@ async def _handle_gensession(event, state: dict, text: str):
         phone = text
         await event.reply("⏳ Connecting to Telegram...")
         try:
-            from telethon.sessions import StringSession
             temp_session = StringSession()
-            client = TelegramClient(temp_session, Config.API_ID, Config.API_HASH)
+            client = TelegramClient(
+                temp_session, Config.API_ID, Config.API_HASH
+            )
             await client.connect()
             result = await client.send_code_request(phone)
             _set(uid, {
@@ -346,7 +378,10 @@ async def _handle_gensession(event, state: dict, text: str):
                 "phone": phone, "client": client,
                 "phone_code_hash": result.phone_code_hash,
             })
-            await event.reply("📱 Verification code sent!\n\nSend the code (digits only):")
+            await event.reply(
+                "📱 Verification code sent!\n\n"
+                "Send the code (digits only):"
+            )
         except Exception as e:
             _clear(uid)
             await event.reply(f"❌ Failed to send code: {e}")
@@ -356,7 +391,8 @@ async def _handle_gensession(event, state: dict, text: str):
         client = state["client"]
         try:
             await client.sign_in(
-                phone=state["phone"], code=code,
+                phone=state["phone"],
+                code=code,
                 phone_code_hash=state["phone_code_hash"],
             )
             session_str = client.session.save()
@@ -365,15 +401,19 @@ async def _handle_gensession(event, state: dict, text: str):
             await event.reply(
                 "✅ **Session generated!**\n\n"
                 f"`{session_str}`\n\n"
-                "Copy this string, set it as `SESSION_STRING`, then redeploy."
+                "Copy this string, set it as `SESSION_STRING`, "
+                "then redeploy."
             )
         except SessionPasswordNeededError:
             _set(uid, {
                 "cmd": "gensession", "step": "2fa",
                 "phone": state["phone"], "client": client,
-                "phone_code_hash": state["phone_code_hash"], "code": code,
+                "phone_code_hash": state["phone_code_hash"],
+                "code": code,
             })
-            await event.reply("🔐 Two-factor auth enabled.\nSend your password:")
+            await event.reply(
+                "🔐 Two-factor auth enabled.\nSend your password:"
+            )
         except Exception as e:
             _clear(uid)
             try:
@@ -392,7 +432,8 @@ async def _handle_gensession(event, state: dict, text: str):
             await event.reply(
                 "✅ **Session generated!**\n\n"
                 f"`{session_str}`\n\n"
-                "Copy this string, set it as `SESSION_STRING`, then redeploy."
+                "Copy this string, set it as `SESSION_STRING`, "
+                "then redeploy."
             )
         except Exception as e:
             _clear(uid)
@@ -410,15 +451,19 @@ async def _handle_setsource(event, userbot, db: Database, text: str):
         cid = entity.id
         name = getattr(entity, "title", None) or text
 
-        # Reset tracking for previous source
         old = await db.get_settings()
         old_src = old.get("source_channel")
         if old_src:
             await db.delete_post_tracking(old_src)
 
-        await db.update_settings({"source_channel": cid, "source_name": name})
+        await db.update_settings({
+            "source_channel": cid,
+            "source_name": name,
+        })
         _clear(uid)
-        await event.reply(f"✅ Source set to **{name}** (`{cid}`)")
+        await event.reply(
+            f"✅ Source set to **{name}** (`{cid}`)"
+        )
     except Exception as e:
         await event.reply(f"❌ Could not resolve channel: {e}")
 
@@ -431,10 +476,15 @@ async def _handle_addchannel(event, userbot, db: Database, text: str):
         name = getattr(entity, "title", None) or text
         if await db.channel_exists(cid):
             _clear(uid)
-            return await event.reply("⚠️ This channel is already added.")
+            return await event.reply(
+                "⚠️ This channel is already added."
+            )
         await db.add_channel(cid, name)
         _clear(uid)
-        await event.reply(f"✅ Destination added: **{name}**\nDefault limit: 50 posts/day")
+        await event.reply(
+            f"✅ Destination added: **{name}**\n"
+            "Default limit: 50 posts/day"
+        )
     except Exception as e:
         await event.reply(f"❌ Could not resolve channel: {e}")
 
@@ -487,7 +537,9 @@ async def _handle_setlimit(event, db: Database, text: str):
             return await event.reply("❌ Limit must be at least 1.")
         await db.set_channel_limit(cid, limit)
         _clear(uid)
-        await event.reply(f"✅ Daily limit for `{cid}` set to **{limit}**")
+        await event.reply(
+            f"✅ Daily limit for `{cid}` set to **{limit}**"
+        )
     except ValueError:
         await event.reply("❌ Invalid numbers.")
 
@@ -495,10 +547,13 @@ async def _handle_setlimit(event, db: Database, text: str):
 async def _handle_settime(event, db: Database, text: str):
     uid = event.sender_id
     if text.lower() == "off":
-        await db.update_settings({"time_start": None, "time_end": None})
+        await db.update_settings({
+            "time_start": None, "time_end": None
+        })
         _clear(uid)
-        return await event.reply("✅ Time restriction disabled. Posting 24/7.")
-
+        return await event.reply(
+            "✅ Time restriction disabled. Posting 24/7."
+        )
     try:
         parts = text.split("-")
         if len(parts) != 2:
@@ -507,11 +562,17 @@ async def _handle_settime(event, db: Database, text: str):
         end_h = int(parts[1])
         if not (0 <= start_h <= 23 and 0 <= end_h <= 23):
             raise ValueError
-        await db.update_settings({"time_start": start_h, "time_end": end_h})
+        await db.update_settings({
+            "time_start": start_h, "time_end": end_h
+        })
         _clear(uid)
-        await event.reply(f"✅ Time window set: **{start_h}:00 — {end_h}:00**")
+        await event.reply(
+            f"✅ Time window set: **{start_h}:00 — {end_h}:00**"
+        )
     except (ValueError, IndexError):
-        await event.reply("❌ Invalid format. Use `start-end` (e.g. `9-21`) or `off`")
+        await event.reply(
+            "❌ Invalid format. Use `start-end` (e.g. `9-21`) or `off`"
+        )
 
 
 async def _handle_setfooter(event, db: Database, text: str):
@@ -530,31 +591,39 @@ async def _handle_setmode(event, db: Database, text: str):
     mode = text.lower().strip()
     valid = {"forward", "copy", "text_only"}
     if mode not in valid:
-        return await event.reply(f"❌ Invalid mode. Choose from: {', '.join(valid)}")
+        return await event.reply(
+            f"❌ Invalid mode. Choose from: {', '.join(valid)}"
+        )
     await db.update_settings({"posting_mode": mode})
     _clear(uid)
     await event.reply(f"✅ Posting mode set to **{mode}**")
 
 
+
+
 async def _handle_setlink(event, db: Database, state: dict, text: str):
     uid = event.sender_id
-    mode = text.lower().strip()
-    valid = {"keep", "remove", "replace"}
-    if mode not in valid:
-        return await event.reply(f"❌ Invalid option. Choose from: {', '.join(valid)}")
+    step = state.get("step", "mode")
 
-    if mode == "replace":
-        _set(uid, {"cmd": "setlink", "step": "url"})
-        await event.reply("🔗 Send the replacement URL:")
-        return
+    if step == "mode":
+        mode = text.lower().strip()
+        valid = {"keep", "remove", "replace"}
+        if mode not in valid:
+            return await event.reply(
+                f"❌ Invalid option. Choose from: {', '.join(valid)}"
+            )
+        if mode == "replace":
+            _set(uid, {"cmd": "setlink", "step": "url"})
+            await event.reply("🔗 Send the replacement URL:")
+            return
+        await db.update_settings({"link_mode": mode})
+        _clear(uid)
+        await event.reply(f"✅ Link mode set to **{mode}**")
 
-    await db.update_settings({"link_mode": mode})
-    _clear(uid)
-    await event.reply(f"✅ Link mode set to **{mode}**")
-
-    # Handle the URL step (called when step == "url")
-    if state.get("step") == "url":
+    elif step == "url":
         url = text.strip()
-        await db.update_settings({"link_mode": "replace", "replace_link": url})
+        await db.update_settings({
+            "link_mode": "replace", "replace_link": url
+        })
         _clear(uid)
         await event.reply(f"✅ Links will be replaced with:\n{url}")
