@@ -113,46 +113,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())                Config.API_ID,
-                Config.API_HASH,
-            )
-            await userbot.start()
-            me = await userbot.get_me()
-            logger.info(f"✅ Userbot connected as {me.first_name} (ID {me.id})")
-        except Exception as e:
-            logger.error(f"❌ Userbot failed to start: {e}")
-            userbot = None
-    else:
-        logger.warning("⚠️  No SESSION_STRING — userbot disabled. Use /gensession to create one.")
-
-    # ── Bot ─────────────────────────────────────────────────────
-    bot = TelegramClient("bot_session", Config.API_ID, Config.API_HASH)
-    await bot.start(bot_token=Config.BOT_TOKEN)
-    bot_me = await bot.get_me()
-    logger.info(f"✅ Bot connected as @{bot_me.username}")
-
-    # ── Register command handlers ───────────────────────────────
-    register_handlers(bot, userbot, db)
-
-    # ── Start posting engine ────────────────────────────────────
-    poster = None
-    if userbot:
-        poster = PostingEngine(userbot, db)
-        await poster.start()
-
-    logger.info("🟢 Bot is fully running")
-
-    # ── Keep alive ──────────────────────────────────────────────
-    try:
-        await bot.run_until_disconnected()
-    finally:
-        if poster:
-            await poster.stop()
-        if userbot:
-            await userbot.disconnect()
-        await db.disconnect()
-        logger.info("🛑 Bot shut down")
-
-
-if __name__ == "__main__":
     asyncio.run(main())
