@@ -1,3 +1,4 @@
+import re
 import logging
 from telethon import events, TelegramClient
 from telethon.errors import SessionPasswordNeededError
@@ -7,319 +8,496 @@ from db import Database
 
 logger = logging.getLogger(__name__)
 
-# ── Multi-step state storage ────────────────────────────────────
+# ── Multi-step state ────────────────────────────────────────────
 _states: dict[int, dict] = {}
 
 
-def _get(uid: int):
+def _get(uid):
     return _states.get(uid)
 
 
-def _set(uid: int, state: dict):
+def _set(uid, state):
     _states[uid] = state
 
 
-def _clear(uid: int):
+def _clear(uid):
     _states.pop(uid, None)
 
 
-# ── Register all handlers ───────────────────────────────────────
-def register_handlers(bot: TelegramClient, userbot, db: Database):
+# ── Robust text cleaner ────────────────────────────────────────
+def _clean(text: str) -> str:
+    """Strip markdown formatting characters that Telegram may inject."""
+    return re.sub(r"[*_~`>\[\]()|]", "", text).strip().lower()
 
-    # ---- /start ----
+
+# ── Ensure user has a selected setup, returns (setup_id, setup) ─
+async def _require_setup(event, db: Database, action: str = "do this"):
+    uid = event.sender_id
+    sid = await db.get_selected_setup(uid)
+    if not sid:
+        await event.reply(
+            f"❌ No setup selected.\n"
+            f"Use /newsetup to create one, or /setups to see existing ones."
+        )
+        return None, None
+    setup = await db.get_setup(sid)
+    if not setup:
+        await db.clear_selected_setup(uid)
+        await event.reply("❌ Selected setup was deleted. Use /newsetup.")
+        return None, None
+    return sid, setup
+
+
+# ═══════════════════════════════════════════════════════════════
+#  REGISTER ALL HANDLERS
+# ═══════════════════════════════════════════════════════════════
+def register_handlers(bot: TelegramClient, userbot, db: Database,
+                      poster=None):
+
+    # ──────────────── /start ────────────────
     @bot.on(events.NewMessage(pattern=r"/start(?!\S)"))
     async def cmd_start(event):
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
+            return
         await event.reply(
-            "👋 **Welcome to AutoPost Bot**\n\n"
-            "Use /help to see all commands.\n\n"
-            "If you haven't set up a session yet, use /gensession first."
+            "👋 **AutoPost Bot — Multi-Setup Edition**\n\n"
+            "Use /help to see all commands."
         )
 
-    # ---- /help ----
+    # ──────────────── /help ────────────────
     @bot.on(events.NewMessage(pattern=r"/help(?!\S)"))
     async def cmd_help(event):
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
+            return
         await event.reply(
             "📖 **Commands**\n\n"
-            "🔧 **Setup**\n"
-            "/gensession — Generate session string\n"
+            "📦 **Setups**\n"
+            "/newsetup — Create a new setup\n"
+            "/setups — List all setups\n"
+            "/select _id_ — Select a setup to edit\n"
+            "/delsetup _id_ — Delete a setup\n\n"
+            "📌 **Per-Setup Config** (select a setup first)\n"
             "/setsource — Set source channel\n"
             "/addchannel — Add destination channel\n"
-            "/removechannel — Remove destination channel\n"
-            "/addadmin — Add admin (by user ID)\n"
-            "/removeadmin — Remove admin\n\n"
-            "⚙️ **Configuration**\n"
-            "/setlimit — Set daily post limit\n"
-            "/settime — Set posting time window\n"
-            "/setfooter — Set caption footer\n"
-            "/setmode — Set posting mode\n"
-            "/setlink — Set link handling\n\n"
-            "▶️ **Control**\n"
-            "/pause — Pause posting\n"
-            "/resume — Resume posting\n"
-            "/status — Show status\n"
+            "/removechannel — Remove destination\n"
+            "/setlimit _channel_id limit_ — Daily limit\n"
+            "/settime — Posting time window\n"
+            "/setfooter — Caption footer\n"
+            "/setmode _mode_ — forward / copy / text_only\n"
+            "/setlink _mode_ — keep / remove / replace\n"
+            "/loop — Toggle loop mode\n"
+            "/pause — Pause selected setup\n"
+            "/resume — Resume selected setup\n\n"
+            "🔧 **System**\n"
+            "/gensession — Generate session string\n"
+            "/addadmin — Add admin\n"
+            "/removeadmin — Remove admin\n"
+            "/status — Full status overview\n"
             "/cancel — Cancel current operation"
         )
 
-    # ---- /gensession ----
-    @bot.on(events.NewMessage(pattern=r"/gensession(?!\S)"))
-    async def cmd_gensession(event):
+    # ──────────────── /newsetup ────────────────
+    @bot.on(events.NewMessage(pattern=r"/newsetup(?!\S)"))
+    async def cmd_newsetup(event):
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
-        if Config.SESSION_STRING:
-            return await event.reply("⚠️ Session string is already configured.")
+            return
+        sid = await db.create_setup()
+        await db.set_selected_setup(event.sender_id, sid)
         await event.reply(
-            "🔐 **Session String Generator**\n\n"
-            "Send your phone number with country code:\n"
-            "Example: `+1234567890`"
+            f"✅ **Setup #{sid}** created and selected.\n\n"
+            f"Now configure it:\n"
+            f"1. /setsource — pick the source channel\n"
+            f"2. /addchannel — add destinations\n"
+            f"3. /setmode, /setfooter, /settime, etc."
         )
-        _set(event.sender_id, {"cmd": "gensession", "step": "phone"})
 
-    # ---- /setsource ----
+    # ──────────────── /setups ────────────────
+    @bot.on(events.NewMessage(pattern=r"/setups(?!\S)"))
+    async def cmd_setups(event):
+        if not await db.is_admin(event.sender_id):
+            return
+        setups = await db.get_all_setups()
+        if not setups:
+            return await event.reply("📭 No setups yet. Use /newsetup.")
+        sel = await db.get_selected_setup(event.sender_id)
+        lines = []
+        for s in setups:
+            marker = " ◀️" if s["setup_id"] == sel else ""
+            src = s.get("source_name") or "No source"
+            dsts = len(s.get("destinations", []))
+            paused = " ⏸" if s.get("is_paused") else " ▶️"
+            lines.append(
+                f"**#{s['setup_id']}**{marker}{paused}  "
+                f"Source: {src}  →  {dsts} dest(s)"
+            )
+        await event.reply("📦 **Setups**\n\n" + "\n".join(lines))
+
+    # ──────────────── /select ────────────────
+    @bot.on(events.NewMessage(pattern=r"/select\s+(\d+)(?!\S)"))
+    async def cmd_select(event):
+        if not await db.is_admin(event.sender_id):
+            return
+        sid = int(event.pattern_match.group(1))
+        setup = await db.get_setup(sid)
+        if not setup:
+            return await event.reply(f"❌ Setup #{sid} not found.")
+        await db.set_selected_setup(event.sender_id, sid)
+        src = setup.get("source_name") or "No source"
+        dsts = len(setup.get("destinations", []))
+        await event.reply(
+            f"✅ Selected **Setup #{sid}**\n"
+            f"📌 Source: {src}\n"
+            f"📤 Destinations: {dsts}"
+        )
+
+    # ──────────────── /delsetup ────────────────
+    @bot.on(events.NewMessage(pattern=r"/delsetup\s+(\d+)(?!\S)"))
+    async def cmd_delsetup(event):
+        if not await db.is_admin(event.sender_id):
+            return
+        sid = int(event.pattern_match.group(1))
+        setup = await db.get_setup(sid)
+        if not setup:
+            return await event.reply(f"❌ Setup #{sid} not found.")
+        await db.delete_setup(sid)
+        if poster:
+            await poster.stop_setup(sid)
+        sel = await db.get_selected_setup(event.sender_id)
+        if sel == sid:
+            await db.clear_selected_setup(event.sender_id)
+        await event.reply(f"🗑 Setup #{sid} deleted.")
+
+    # ──────────────── /setsource ────────────────
     @bot.on(events.NewMessage(pattern=r"/setsource(?!\S)"))
     async def cmd_setsource(event):
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
+            return
         if not userbot:
-            return await event.reply(
-                "❌ Userbot is not connected.\nSet `SESSION_STRING` and restart."
-            )
+            return await event.reply("❌ Userbot not connected.")
+        sid, _ = await _require_setup(event, db, "set source")
+        if sid is None:
+            return
         await event.reply(
-            "📌 **Set Source Channel**\n\n"
+            f"📌 **Setup #{sid}** — Set Source Channel\n\n"
             "Send the channel username or ID:\n"
             "Example: `@mysource` or `-1001234567890`"
         )
-        _set(event.sender_id, {"cmd": "setsource"})
+        _set(event.sender_id, {"cmd": "setsource", "setup_id": sid})
 
-    # ---- /addchannel ----
+    # ──────────────── /addchannel ────────────────
     @bot.on(events.NewMessage(pattern=r"/addchannel(?!\S)"))
     async def cmd_addchannel(event):
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
+            return
         if not userbot:
-            return await event.reply(
-                "❌ Userbot is not connected.\nSet `SESSION_STRING` and restart."
-            )
+            return await event.reply("❌ Userbot not connected.")
+        sid, _ = await _require_setup(event, db, "add channel")
+        if sid is None:
+            return
         await event.reply(
-            "➕ **Add Destination Channel**\n\n"
+            f"➕ **Setup #{sid}** — Add Destination\n\n"
             "Send the channel username or ID:\n"
             "Example: `@mydest` or `-1001234567890`"
         )
-        _set(event.sender_id, {"cmd": "addchannel"})
+        _set(event.sender_id, {"cmd": "addchannel", "setup_id": sid})
 
-    # ---- /removechannel ----
+    # ──────────────── /removechannel ────────────────
     @bot.on(events.NewMessage(pattern=r"/removechannel(?!\S)"))
     async def cmd_removechannel(event):
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
-        channels = await db.get_all_channels()
-        if not channels:
-            return await event.reply("❌ No channels added yet.")
+            return
+        sid, setup = await _require_setup(event, db, "remove channel")
+        if sid is None:
+            return
+        dsts = setup.get("destinations", [])
+        if not dsts:
+            return await event.reply("❌ No destinations in this setup.")
         lines = []
-        for i, ch in enumerate(channels, 1):
+        for d in dsts:
             lines.append(
-                f"{i}. {ch.get('channel_name', ch['channel_id'])} "
-                f"(`{ch['channel_id']}`)"
+                f"• {d.get('channel_name', d['channel_id'])} "
+                f"(`{d['channel_id']}`)"
             )
         await event.reply(
-            "➖ **Remove Channel**\n\n"
-            "Send the channel ID to remove:\n\n" + "\n".join(lines)
+            f"➖ **Setup #{sid}** — Remove Destination\n\n"
+            "Send the channel ID:\n\n" + "\n".join(lines)
         )
-        _set(event.sender_id, {"cmd": "removechannel"})
+        _set(event.sender_id, {"cmd": "removechannel", "setup_id": sid})
 
-    # ---- /addadmin ----
-    @bot.on(events.NewMessage(pattern=r"/addadmin(?!\S)"))
-    async def cmd_addadmin(event):
-        if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
-        await event.reply("👤 Send the **user ID** to add as admin:")
-        _set(event.sender_id, {"cmd": "addadmin"})
-
-    # ---- /removeadmin ----
-    @bot.on(events.NewMessage(pattern=r"/removeadmin(?!\S)"))
-    async def cmd_removeadmin(event):
-        if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
-        admins = await db.get_admins()
-        lines = [
-            f"• `{a['user_id']}` — {a.get('name', 'Admin')}" for a in admins
-        ]
-        await event.reply(
-            "🗑 **Remove Admin**\n\n"
-            "Send the user ID to remove:\n\n" + "\n".join(lines)
-        )
-        _set(event.sender_id, {"cmd": "removeadmin"})
-
-    # ---- /setlimit ----
-    @bot.on(events.NewMessage(pattern=r"/setlimit(?!\S)"))
+    # ──────────────── /setlimit (one-shot) ────────────────
+    @bot.on(events.NewMessage(pattern=r"/setlimit\s+(\S+)\s+(\d+)(?!\S)"))
     async def cmd_setlimit(event):
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
-        channels = await db.get_all_channels()
-        if not channels:
-            return await event.reply("❌ No channels added.")
-        lines = []
-        for ch in channels:
-            lim = ch.get("daily_limit", 50)
-            lines.append(
-                f"• {ch.get('channel_name', ch['channel_id'])} "
-                f"(`{ch['channel_id']}`) — current: {lim}"
-            )
-        await event.reply(
-            "🔢 **Set Daily Limit**\n\n"
-            "Send in format: `channel_id limit`\n\n" + "\n".join(lines)
-        )
-        _set(event.sender_id, {"cmd": "setlimit"})
+            return
+        sid, _ = await _require_setup(event, db, "set limit")
+        if sid is None:
+            return
+        cid = int(event.pattern_match.group(1))
+        limit = int(event.pattern_match.group(2))
+        if limit < 1:
+            return await event.reply("❌ Limit must be ≥ 1.")
+        await db.set_destination_limit(sid, cid, limit)
+        await event.reply(f"✅ Daily limit for `{cid}` → **{limit}**")
 
-    # ---- /settime ----
+    # ──────────────── /settime ────────────────
     @bot.on(events.NewMessage(pattern=r"/settime(?!\S)"))
     async def cmd_settime(event):
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
+            return
+        sid, _ = await _require_setup(event, db, "set time")
+        if sid is None:
+            return
         await event.reply(
-            "⏱ **Set Posting Time Window**\n\n"
-            "Send in format: `start-end` (hours, 0-23)\n"
-            "Example: `9-21` (posts from 9 AM to 9 PM)\n"
-            "Send `off` to disable time restriction."
+            f"⏱ **Setup #{sid}** — Set Time Window\n\n"
+            "Send `start-end` (hours 0-23), e.g. `9-21`\n"
+            "Send `off` for 24/7 posting."
         )
-        _set(event.sender_id, {"cmd": "settime"})
+        _set(event.sender_id, {"cmd": "settime", "setup_id": sid})
 
-    # ---- /setfooter ----
+    # ──────────────── /setfooter ────────────────
     @bot.on(events.NewMessage(pattern=r"/setfooter(?!\S)"))
     async def cmd_setfooter(event):
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
+            return
+        sid, _ = await _require_setup(event, db, "set footer")
+        if sid is None:
+            return
         await event.reply(
-            "✏️ **Set Caption Footer**\n\n"
-            "Send the footer text to append to every post.\n"
-            "Send `none` to remove footer."
+            f"✏️ **Setup #{sid}** — Set Footer\n\n"
+            "Send the footer text, or `none` to remove."
         )
-        _set(event.sender_id, {"cmd": "setfooter"})
+        _set(event.sender_id, {"cmd": "setfooter", "setup_id": sid})
 
-    # ---- /setmode ----
+    # ──────────────── /setmode (one-shot OR interactive) ──────
+    @bot.on(events.NewMessage(pattern=r"/setmode\s+(\S+)(?!\S)"))
+    async def cmd_setmode_oneshot(event):
+        """One-shot: /setmode copy"""
+        if not await db.is_admin(event.sender_id):
+            return
+        sid, _ = await _require_setup(event, db, "set mode")
+        if sid is None:
+            return
+        raw = event.pattern_match.group(1)
+        mode = _clean(raw)
+        valid = {"forward", "copy", "text_only"}
+        if mode not in valid:
+            return await event.reply(
+                f"❌ Invalid mode `{raw}`.\nUse: forward, copy, or text_only"
+            )
+        await db.update_setup(sid, {"posting_mode": mode})
+        await event.reply(f"✅ Setup #{sid} mode → **{mode}**")
+
     @bot.on(events.NewMessage(pattern=r"/setmode(?!\S)"))
-    async def cmd_setmode(event):
+    async def cmd_setmode_interactive(event):
+        """Interactive: /setmode (no arg)"""
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
+            return
+        sid, _ = await _require_setup(event, db, "set mode")
+        if sid is None:
+            return
+        setup = await db.get_setup(sid)
+        current = setup.get("posting_mode", "copy") if setup else "copy"
         await event.reply(
-            "📋 **Set Posting Mode**\n\n"
-            "Send one of:\n"
-            "`forward` — Forward messages as-is\n"
-            "`copy` — Copy media with modified caption\n"
-            "`text_only` — Send text only (no media)"
+            f"📋 **Setup #{sid}** — Set Mode\n\n"
+            f"Current: **{current}**\n\n"
+            "Send:\n"
+            "• forward\n"
+            "• copy\n"
+            "• text_only"
         )
-        _set(event.sender_id, {"cmd": "setmode"})
+        _set(event.sender_id, {"cmd": "setmode", "setup_id": sid})
 
-    # ---- /setlink ----
+    # ──────────────── /setlink (one-shot OR interactive) ──────
+    @bot.on(events.NewMessage(pattern=r"/setlink\s+(\S+)(?!\S)"))
+    async def cmd_setlink_oneshot(event):
+        if not await db.is_admin(event.sender_id):
+            return
+        sid, _ = await _require_setup(event, db, "set link mode")
+        if sid is None:
+            return
+        raw = event.pattern_match.group(1)
+        mode = _clean(raw)
+        if mode not in {"keep", "remove", "replace"}:
+            return await event.reply(
+                "❌ Invalid. Use: keep, remove, or replace"
+            )
+        if mode == "replace":
+            await event.reply("🔗 Send the replacement URL:")
+            _set(event.sender_id, {
+                "cmd": "setlink", "step": "url", "setup_id": sid
+            })
+            return
+        await db.update_setup(sid, {"link_mode": mode})
+        await event.reply(f"✅ Setup #{sid} link mode → **{mode}**")
+
     @bot.on(events.NewMessage(pattern=r"/setlink(?!\S)"))
-    async def cmd_setlink(event):
+    async def cmd_setlink_interactive(event):
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
+            return
+        sid, _ = await _require_setup(event, db, "set link mode")
+        if sid is None:
+            return
         await event.reply(
-            "🔗 **Set Link Handling**\n\n"
-            "Send one of:\n"
-            "`keep` — Keep all links\n"
-            "`remove` — Remove t.me links\n"
-            "`replace` — Replace t.me links (you'll be asked for URL)"
+            f"🔗 **Setup #{sid}** — Set Link Mode\n\n"
+            "Send: keep / remove / replace"
         )
-        _set(event.sender_id, {"cmd": "setlink", "step": "mode"})
+        _set(event.sender_id, {
+            "cmd": "setlink", "step": "mode", "setup_id": sid
+        })
 
-    # ---- /pause ----
+    # ──────────────── /loop ────────────────
+    @bot.on(events.NewMessage(pattern=r"/loop(?!\S)"))
+    async def cmd_loop(event):
+        if not await db.is_admin(event.sender_id):
+            return
+        sid, setup = await _require_setup(event, db, "toggle loop")
+        if sid is None:
+            return
+        new_val = not setup.get("loop_enabled", False)
+        await db.update_setup(sid, {"loop_enabled": new_val})
+        state = "ON ✅" if new_val else "OFF ❌"
+        await event.reply(f"🔄 Setup #{sid} loop → **{state}**")
+
+    # ──────────────── /pause ────────────────
     @bot.on(events.NewMessage(pattern=r"/pause(?!\S)"))
     async def cmd_pause(event):
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
-        await db.update_settings({"is_paused": True})
-        await event.reply("⏸ Posting **paused**.")
+            return
+        sid, _ = await _require_setup(event, db, "pause")
+        if sid is None:
+            return
+        await db.update_setup(sid, {"is_paused": True})
+        if poster:
+            await poster.stop_setup(sid)
+        await event.reply(f"⏸ Setup #{sid} **paused**.")
 
-    # ---- /resume ----
+    # ──────────────── /resume ────────────────
     @bot.on(events.NewMessage(pattern=r"/resume(?!\S)"))
     async def cmd_resume(event):
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
-        await db.update_settings({"is_paused": False})
-        await event.reply("▶️ Posting **resumed**.")
+            return
+        sid, setup = await _require_setup(event, db, "resume")
+        if sid is None:
+            return
+        if not setup.get("source_channel"):
+            return await event.reply(
+                "❌ Set a source channel first with /setsource"
+            )
+        await db.update_setup(sid, {"is_paused": False})
+        if poster:
+            await poster.start_setup(sid)
+        await event.reply(f"▶️ Setup #{sid} **resumed**.")
 
-    # ---- /status ----
+    # ──────────────── /status ────────────────
     @bot.on(events.NewMessage(pattern=r"/status(?!\S)"))
     async def cmd_status(event):
         if not await db.is_admin(event.sender_id):
-            return await event.reply("❌ You are not authorized.")
-        s = await db.get_settings()
-        channels = await db.get_all_channels()
-        tracking = {}
+            return
+        setups = await db.get_all_setups()
+        sel = await db.get_selected_setup(event.sender_id)
 
-        src_id = s.get("source_channel")
-        if src_id:
-            tracking = await db.get_post_tracking(src_id)
+        if not setups:
+            return await event.reply("📭 No setups. Use /newsetup.")
 
-        mode = s.get("posting_mode", "copy")
-        link_mode = s.get("link_mode", "keep")
-        footer = s.get("footer", "")
-        paused = s.get("is_paused", False)
-        loop = s.get("loop_enabled", False)
-        t_start = s.get("time_start")
-        t_end = s.get("time_end")
+        blocks = []
+        for s in setups:
+            marker = " ◀️" if s["setup_id"] == sel else ""
+            icon = "⏸" if s.get("is_paused") else "▶️"
+            src = s.get("source_name") or "Not set"
+            mode = s.get("posting_mode", "copy")
+            link = s.get("link_mode", "keep")
+            footer = s.get("footer", "") or "None"
+            loop = "ON" if s.get("loop_enabled") else "OFF"
+            ts = s.get("time_start")
+            te = s.get("time_end")
+            tw = f"{ts}:00–{te}:00" if ts is not None else "24/7"
+            dsts = s.get("destinations", [])
 
-        status_icon = "⏸ Paused" if paused else "▶️ Running"
-        time_str = (
-            f"{t_start}:00 — {t_end}:00"
-            if t_start is not None
-            else "Always"
+            lines = [
+                f"{'━' * 30}",
+                f"{icon} **Setup #{s['setup_id']}**{marker}",
+                f"📌 Source: {src}",
+                f"📋 Mode: {mode}  |  🔗 Links: {link}",
+                f"✏️ Footer: {footer}  |  🔄 Loop: {loop}",
+                f"⏱ Window: {tw}",
+                f"📤 Destinations: {len(dsts)}",
+            ]
+
+            if dsts:
+                lines.append("")
+                for d in dsts:
+                    cnt = await db.get_daily_count(s["setup_id"], d["channel_id"])
+                    lim = d.get("daily_limit", 50)
+                    nm = d.get("channel_name", str(d["channel_id"]))
+                    bar_len = 10
+                    filled = min(int(cnt / max(lim, 1) * bar_len), bar_len)
+                    bar = "█" * filled + "░" * (bar_len - filled)
+                    lines.append(f"  └ {nm}: [{bar}] {cnt}/{lim}")
+
+            # Tracking info
+            src_id = s.get("source_channel")
+            if src_id:
+                trk = await db.get_post_tracking(s["setup_id"], src_id)
+                if trk:
+                    lines.append(
+                        f"  📍 Pointer: {trk.get('current_id', '?')} "
+                        f"(start: {trk.get('start_id', '?')})"
+                    )
+
+            blocks.append("\n".join(lines))
+
+        await event.reply("\n".join(blocks))
+
+    # ──────────────── /gensession ────────────────
+    @bot.on(events.NewMessage(pattern=r"/gensession(?!\S)"))
+    async def cmd_gensession(event):
+        if not await db.is_admin(event.sender_id):
+            return
+        if Config.SESSION_STRING:
+            return await event.reply("⚠️ Session already configured.")
+        await event.reply(
+            "🔐 **Session Generator**\n\n"
+            "Send phone with country code:\n`+1234567890`"
         )
-        src_name = s.get("source_name", "Not set")
+        _set(event.sender_id, {"cmd": "gensession", "step": "phone"})
 
+    # ──────────────── /addadmin ────────────────
+    @bot.on(events.NewMessage(pattern=r"/addadmin(?!\S)"))
+    async def cmd_addadmin(event):
+        if not await db.is_admin(event.sender_id):
+            return
+        await event.reply("👤 Send the **user ID** to add as admin:")
+        _set(event.sender_id, {"cmd": "addadmin"})
+
+    # ──────────────── /removeadmin ────────────────
+    @bot.on(events.NewMessage(pattern=r"/removeadmin(?!\S)"))
+    async def cmd_removeadmin(event):
+        if not await db.is_admin(event.sender_id):
+            return
+        admins = await db.get_admins()
         lines = [
-            "📊 **Bot Status**\n",
-            f"🔸 **Source**: {src_name}",
-            f"🔸 **Destinations**: {len(channels)}",
-            f"🔸 **Mode**: {mode}",
-            f"🔸 **Links**: {link_mode}",
-            f"🔸 **Footer**: {footer if footer else 'None'}",
-            f"🔸 **Time Window**: {time_str}",
-            f"🔸 **Loop**: {'ON' if loop else 'OFF'}",
-            f"🔸 **Status**: {status_icon}",
+            f"• `{a['user_id']}` — {a.get('name', 'Admin')}"
+            for a in admins
         ]
+        await event.reply(
+            "🗑 Send the user ID to remove:\n\n" + "\n".join(lines)
+        )
+        _set(event.sender_id, {"cmd": "removeadmin"})
 
-        if tracking:
-            lines.append(
-                f"🔸 **Pointer**: {tracking.get('current_id', '?')}"
-            )
-            lines.append(
-                f"🔸 **Start ID**: {tracking.get('start_id', '?')}"
-            )
-
-        if channels:
-            lines.append("\n📋 **Channel Limits**:")
-            for ch in channels:
-                cnt = await db.get_daily_count(ch["channel_id"])
-                lim = ch.get("daily_limit", 50)
-                name = ch.get("channel_name", str(ch["channel_id"]))
-                lines.append(f"├ {name}: {cnt}/{lim} today")
-
-        await event.reply("\n".join(lines))
-
-    # ---- /cancel ----
+    # ──────────────── /cancel ────────────────
     @bot.on(events.NewMessage(pattern=r"/cancel(?!\S)"))
     async def cmd_cancel(event):
         _clear(event.sender_id)
-        await event.reply("✅ Operation cancelled.")
+        await event.reply("✅ Cancelled.")
 
-    # ── Generic private message handler (multi-step flows) ─────
-    @bot.on(
-        events.NewMessage(
-            incoming=True,
-            func=lambda e: (
-                e.is_private
-                and bool(e.text)
-                and not e.text.startswith("/")
-            ),
-        )
-    )
-    async def on_private_message(event):
+    # ═══════════════════════════════════════════════════════════
+    #  GENERIC PRIVATE MESSAGE (multi-step flows)
+    # ═══════════════════════════════════════════════════════════
+    @bot.on(events.NewMessage(
+        incoming=True,
+        func=lambda e: e.is_private and bool(e.text) and not e.text.startswith("/"),
+    ))
+    async def on_private_text(event):
         uid = event.sender_id
         state = _get(uid)
         if not state:
@@ -327,303 +505,238 @@ def register_handlers(bot: TelegramClient, userbot, db: Database):
 
         text = (event.text or "").strip()
         cmd = state["cmd"]
+        sid = state.get("setup_id")
 
         try:
             if cmd == "gensession":
-                await _handle_gensession(event, state, text)
+                await _flow_gensession(event, state, text)
             elif cmd == "setsource":
-                await _handle_setsource(event, userbot, db, text)
+                await _flow_setsource(event, userbot, db, sid, text)
             elif cmd == "addchannel":
-                await _handle_addchannel(event, userbot, db, text)
+                await _flow_addchannel(event, userbot, db, sid, text)
             elif cmd == "removechannel":
-                await _handle_removechannel(event, db, text)
-            elif cmd == "addadmin":
-                await _handle_addadmin(event, db, text)
-            elif cmd == "removeadmin":
-                await _handle_removeadmin(event, db, text)
-            elif cmd == "setlimit":
-                await _handle_setlimit(event, db, text)
+                await _flow_removechannel(event, db, sid, text)
             elif cmd == "settime":
-                await _handle_settime(event, db, text)
+                await _flow_settime(event, db, sid, text)
             elif cmd == "setfooter":
-                await _handle_setfooter(event, db, text)
+                await _flow_setfooter(event, db, sid, text)
             elif cmd == "setmode":
-                await _handle_setmode(event, db, text)
+                await _flow_setmode(event, db, sid, text)
             elif cmd == "setlink":
-                await _handle_setlink(event, db, state, text)
+                await _flow_setlink(event, db, state, text)
+            elif cmd == "addadmin":
+                await _flow_addadmin(event, db, text)
+            elif cmd == "removeadmin":
+                await _flow_removeadmin(event, db, text)
         except Exception as exc:
-            logger.error(f"Handler error for {cmd}: {exc}", exc_info=True)
+            logger.error(f"Flow error [{cmd}]: {exc}", exc_info=True)
             _clear(uid)
             await event.reply(f"❌ Error: {exc}")
 
 
-# ── Multi-step handler implementations ──────────────────────────
 
-async def _handle_gensession(event, state: dict, text: str):
+# ═══════════════════════════════════════════════════════════════
+#  FLOW IMPLEMENTATIONS
+# ═══════════════════════════════════════════════════════════════
+
+async def _flow_gensession(event, state, text):
     uid = event.sender_id
     step = state["step"]
 
     if step == "phone":
-        phone = text
-        await event.reply("⏳ Connecting to Telegram...")
+        await event.reply("⏳ Connecting...")
         try:
-            temp_session = StringSession()
-            client = TelegramClient(
-                temp_session, Config.API_ID, Config.API_HASH
-            )
-            await client.connect()
-            result = await client.send_code_request(phone)
+            sess = StringSession()
+            cl = TelegramClient(sess, Config.API_ID, Config.API_HASH)
+            await cl.connect()
+            r = await cl.send_code_request(text)
             _set(uid, {
                 "cmd": "gensession", "step": "code",
-                "phone": phone, "client": client,
-                "phone_code_hash": result.phone_code_hash,
+                "phone": text, "client": cl,
+                "hash": r.phone_code_hash,
             })
-            await event.reply(
-                "📱 Verification code sent!\n\n"
-                "Send the code (digits only):"
-            )
+            await event.reply("📱 Code sent! Send digits only:")
         except Exception as e:
             _clear(uid)
-            await event.reply(f"❌ Failed to send code: {e}")
+            await event.reply(f"❌ {e}")
 
     elif step == "code":
-        code = text.replace(" ", "").replace("-", "")
-        client = state["client"]
+        cl = state["client"]
         try:
-            await client.sign_in(
+            await cl.sign_in(
                 phone=state["phone"],
-                code=code,
-                phone_code_hash=state["phone_code_hash"],
+                code=text.replace(" ", "").replace("-", ""),
+                phone_code_hash=state["hash"],
             )
-            session_str = client.session.save()
-            await client.disconnect()
+            s = cl.session.save()
+            await cl.disconnect()
             _clear(uid)
             await event.reply(
-                "✅ **Session generated!**\n\n"
-                f"`{session_str}`\n\n"
-                "Copy this string, set it as `SESSION_STRING`, "
-                "then redeploy."
+                f"✅ **Session generated!**\n\n`{s}`\n\n"
+                "Set as `SESSION_STRING` and redeploy."
             )
         except SessionPasswordNeededError:
             _set(uid, {
                 "cmd": "gensession", "step": "2fa",
-                "phone": state["phone"], "client": client,
-                "phone_code_hash": state["phone_code_hash"],
-                "code": code,
+                "phone": state["phone"], "client": cl,
+                "hash": state["hash"],
             })
-            await event.reply(
-                "🔐 Two-factor auth enabled.\nSend your password:"
-            )
+            await event.reply("🔐 2FA enabled. Send password:")
         except Exception as e:
             _clear(uid)
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            await event.reply(f"❌ Sign-in failed: {e}")
+            try: await cl.disconnect()
+            except: pass
+            await event.reply(f"❌ {e}")
 
     elif step == "2fa":
-        client = state["client"]
+        cl = state["client"]
         try:
-            await client.sign_in(password=text)
-            session_str = client.session.save()
-            await client.disconnect()
+            await cl.sign_in(password=text)
+            s = cl.session.save()
+            await cl.disconnect()
             _clear(uid)
             await event.reply(
-                "✅ **Session generated!**\n\n"
-                f"`{session_str}`\n\n"
-                "Copy this string, set it as `SESSION_STRING`, "
-                "then redeploy."
+                f"✅ **Session generated!**\n\n`{s}`\n\n"
+                "Set as `SESSION_STRING` and redeploy."
             )
         except Exception as e:
             _clear(uid)
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            await event.reply(f"❌ 2FA failed: {e}")
+            try: await cl.disconnect()
+            except: pass
+            await event.reply(f"❌ {e}")
 
 
-async def _handle_setsource(event, userbot, db: Database, text: str):
+async def _flow_setsource(event, userbot, db, sid, text):
     uid = event.sender_id
     try:
-        entity = await userbot.get_entity(text)
-        cid = entity.id
-        name = getattr(entity, "title", None) or text
-
-        old = await db.get_settings()
-        old_src = old.get("source_channel")
-        if old_src:
-            await db.delete_post_tracking(old_src)
-
-        await db.update_settings({
-            "source_channel": cid,
-            "source_name": name,
+        ent = await userbot.get_entity(text)
+        cid, name = ent.id, getattr(ent, "title", None) or text
+        # Reset old tracking
+        old = await db.get_setup(sid)
+        if old and old.get("source_channel"):
+            await db.delete_post_tracking(sid, old["source_channel"])
+        await db.update_setup(sid, {
+            "source_channel": cid, "source_name": name,
         })
         _clear(uid)
-        await event.reply(
-            f"✅ Source set to **{name}** (`{cid}`)"
-        )
+        await event.reply(f"✅ Setup #{sid} source → **{name}** (`{cid}`)")
     except Exception as e:
-        await event.reply(f"❌ Could not resolve channel: {e}")
+        await event.reply(f"❌ {e}")
 
 
-async def _handle_addchannel(event, userbot, db: Database, text: str):
+async def _flow_addchannel(event, userbot, db, sid, text):
     uid = event.sender_id
     try:
-        entity = await userbot.get_entity(text)
-        cid = entity.id
-        name = getattr(entity, "title", None) or text
-        if await db.channel_exists(cid):
+        ent = await userbot.get_entity(text)
+        cid, name = ent.id, getattr(ent, "title", None) or text
+        if await db.dest_exists_in_setup(sid, cid):
             _clear(uid)
-            return await event.reply(
-                "⚠️ This channel is already added."
-            )
-        await db.add_channel(cid, name)
+            return await event.reply("⚠️ Already in this setup.")
+        await db.add_destination(sid, cid, name)
         _clear(uid)
-        await event.reply(
-            f"✅ Destination added: **{name}**\n"
-            "Default limit: 50 posts/day"
-        )
+        await event.reply(f"✅ Added to setup #{sid}: **{name}**")
     except Exception as e:
-        await event.reply(f"❌ Could not resolve channel: {e}")
+        await event.reply(f"❌ {e}")
 
 
-async def _handle_removechannel(event, db: Database, text: str):
+async def _flow_removechannel(event, db, sid, text):
     uid = event.sender_id
     try:
         cid = int(text.strip())
-        await db.remove_channel(cid)
+        await db.remove_destination(sid, cid)
         _clear(uid)
-        await event.reply(f"✅ Channel `{cid}` removed.")
+        await event.reply(f"✅ Removed `{cid}` from setup #{sid}.")
     except ValueError:
         await event.reply("❌ Invalid channel ID.")
 
 
-async def _handle_addadmin(event, db: Database, text: str):
-    uid = event.sender_id
-    try:
-        admin_id = int(text.strip())
-        await db.add_admin(admin_id)
-        _clear(uid)
-        await event.reply(f"✅ Admin added: `{admin_id}`")
-    except ValueError:
-        await event.reply("❌ Invalid user ID.")
-
-
-async def _handle_removeadmin(event, db: Database, text: str):
-    uid = event.sender_id
-    try:
-        admin_id = int(text.strip())
-        if admin_id == Config.OWNER_ID:
-            _clear(uid)
-            return await event.reply("❌ Cannot remove the owner.")
-        await db.remove_admin(admin_id)
-        _clear(uid)
-        await event.reply(f"✅ Admin removed: `{admin_id}`")
-    except ValueError:
-        await event.reply("❌ Invalid user ID.")
-
-
-async def _handle_setlimit(event, db: Database, text: str):
-    uid = event.sender_id
-    parts = text.split()
-    if len(parts) != 2:
-        return await event.reply("❌ Format: `channel_id limit`")
-    try:
-        cid = int(parts[0])
-        limit = int(parts[1])
-        if limit < 1:
-            return await event.reply("❌ Limit must be at least 1.")
-        await db.set_channel_limit(cid, limit)
-        _clear(uid)
-        await event.reply(
-            f"✅ Daily limit for `{cid}` set to **{limit}**"
-        )
-    except ValueError:
-        await event.reply("❌ Invalid numbers.")
-
-
-async def _handle_settime(event, db: Database, text: str):
+async def _flow_settime(event, db, sid, text):
     uid = event.sender_id
     if text.lower() == "off":
-        await db.update_settings({
-            "time_start": None, "time_end": None
-        })
+        await db.update_setup(sid, {"time_start": None, "time_end": None})
         _clear(uid)
-        return await event.reply(
-            "✅ Time restriction disabled. Posting 24/7."
-        )
+        return await event.reply(f"✅ Setup #{sid} → 24/7 posting.")
     try:
         parts = text.split("-")
         if len(parts) != 2:
             raise ValueError
-        start_h = int(parts[0])
-        end_h = int(parts[1])
-        if not (0 <= start_h <= 23 and 0 <= end_h <= 23):
+        sh, eh = int(parts[0]), int(parts[1])
+        if not (0 <= sh <= 23 and 0 <= eh <= 23):
             raise ValueError
-        await db.update_settings({
-            "time_start": start_h, "time_end": end_h
-        })
+        await db.update_setup(sid, {"time_start": sh, "time_end": eh})
         _clear(uid)
-        await event.reply(
-            f"✅ Time window set: **{start_h}:00 — {end_h}:00**"
-        )
+        await event.reply(f"✅ Setup #{sid} → **{sh}:00–{eh}:00**")
     except (ValueError, IndexError):
-        await event.reply(
-            "❌ Invalid format. Use `start-end` (e.g. `9-21`) or `off`"
-        )
+        await event.reply("❌ Use `start-end` (e.g. `9-21`) or `off`")
 
-
-async def _handle_setfooter(event, db: Database, text: str):
+async def _flow_setfooter(event, db, sid, text):
     uid = event.sender_id
     if text.lower() == "none":
-        await db.update_settings({"footer": ""})
+        await db.update_setup(sid, {"footer": ""})
         _clear(uid)
-        return await event.reply("✅ Footer removed.")
-    await db.update_settings({"footer": text})
+        return await event.reply(f"✅ Setup #{sid} footer removed.")
+    await db.update_setup(sid, {"footer": text})
     _clear(uid)
-    await event.reply(f"✅ Footer set to:\n{text}")
+    await event.reply(f"✅ Setup #{sid} footer →\n{text}")
 
 
-async def _handle_setmode(event, db: Database, text: str):
+async def _flow_setmode(event, db, sid, text):
+    """Interactive mode selection — uses _clean() to strip markdown chars."""
     uid = event.sender_id
-    mode = text.lower().strip()
+    mode = _clean(text)
     valid = {"forward", "copy", "text_only"}
     if mode not in valid:
         return await event.reply(
-            f"❌ Invalid mode. Choose from: {', '.join(valid)}"
+            f"❌ Got `{text}`.\nSend exactly: forward, copy, or text_only"
         )
-    await db.update_settings({"posting_mode": mode})
+    await db.update_setup(sid, {"posting_mode": mode})
     _clear(uid)
-    await event.reply(f"✅ Posting mode set to **{mode}**")
+    await event.reply(f"✅ Setup #{sid} mode → **{mode}**")
 
 
-
-
-async def _handle_setlink(event, db: Database, state: dict, text: str):
+async def _flow_setlink(event, db, state, text):
     uid = event.sender_id
+    sid = state.get("setup_id")
     step = state.get("step", "mode")
 
     if step == "mode":
-        mode = text.lower().strip()
-        valid = {"keep", "remove", "replace"}
-        if mode not in valid:
-            return await event.reply(
-                f"❌ Invalid option. Choose from: {', '.join(valid)}"
-            )
+        mode = _clean(text)
+        if mode not in {"keep", "remove", "replace"}:
+            return await event.reply("❌ Send: keep, remove, or replace")
         if mode == "replace":
-            _set(uid, {"cmd": "setlink", "step": "url"})
-            await event.reply("🔗 Send the replacement URL:")
-            return
-        await db.update_settings({"link_mode": mode})
+            _set(uid, {"cmd": "setlink", "step": "url", "setup_id": sid})
+            return await event.reply("🔗 Send the replacement URL:")
+        await db.update_setup(sid, {"link_mode": mode})
         _clear(uid)
-        await event.reply(f"✅ Link mode set to **{mode}**")
+        await event.reply(f"✅ Setup #{sid} links → **{mode}**")
 
     elif step == "url":
-        url = text.strip()
-        await db.update_settings({
-            "link_mode": "replace", "replace_link": url
-        })
+        await db.update_setup(sid, {"link_mode": "replace", "replace_link": text.strip()})
         _clear(uid)
-        await event.reply(f"✅ Links will be replaced with:\n{url}")
+        await event.reply(f"✅ Setup #{sid} links replaced with:\n{text}")
+
+
+async def _flow_addadmin(event, db, text):
+    uid = event.sender_id
+    try:
+        aid = int(text.strip())
+        await db.add_admin(aid)
+        _clear(uid)
+        await event.reply(f"✅ Admin added: `{aid}`")
+    except ValueError:
+        await event.reply("❌ Invalid user ID.")
+
+
+async def _flow_removeadmin(event, db, text):
+    uid = event.sender_id
+    try:
+        aid = int(text.strip())
+        if aid == Config.OWNER_ID:
+            _clear(uid)
+            return await event.reply("❌ Cannot remove owner.")
+        await db.remove_admin(aid)
+        _clear(uid)
+        await event.reply(f"✅ Admin removed: `{aid}`")
+    except ValueError:
+        await event.reply("❌ Invalid user ID.")
+
