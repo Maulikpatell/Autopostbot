@@ -16,29 +16,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("autopost")
 
-# Maximum time to wait for a single FloodWait before giving up
-MAX_FLOODWAIT = 3600  # 1 hour
+MAX_FLOODWAIT = 3600
 
 
-async def _start_with_floodwait(client, label: str, **kwargs):
-    """Start a Telethon client, sleeping through FloodWaits."""
+async def _safe_start(client, label: str, **kwargs):
     for attempt in range(5):
         try:
             await client.start(**kwargs)
             return True
         except FloodWaitError as e:
-            wait = e.seconds
-            if wait > MAX_FLOODWAIT:
-                logger.error(
-                    f"❌ {label}: FloodWait too long ({wait}s), giving up"
-                )
+            if e.seconds > MAX_FLOODWAIT:
+                logger.error(f"❌ {label}: FloodWait {e.seconds}s — giving up")
                 return False
-            logger.warning(
-                f"⏳ {label}: FloodWait {wait}s (attempt {attempt + 1}/5)"
-            )
-            await asyncio.sleep(wait)
+            logger.warning(f"⏳ {label}: FloodWait {e.seconds}s (attempt {attempt+1}/5)")
+            await asyncio.sleep(e.seconds)
         except Exception as e:
-            logger.error(f"❌ {label}: Failed to start — {e}")
+            logger.error(f"❌ {label}: {e}")
             return False
     return False
 
@@ -46,61 +39,51 @@ async def _start_with_floodwait(client, label: str, **kwargs):
 async def main():
     logger.info("🚀 Starting AutoPost Bot...")
 
-    # ── 1. Web server FIRST — health checks pass immediately ───
+    # 1 — Web server first (health check)
     await start_web_server(Config.PORT)
 
-    # ── 2. Database ─────────────────────────────────────────────
+    # 2 — Database
     db = Database(Config.MONGO_URI)
     await db.connect()
     await db.add_admin(Config.OWNER_ID, "Owner")
     logger.info("✅ Database ready")
 
-    # ── 3. Userbot (optional — missing on first deploy) ────────
+    # 3 — Userbot (optional)
     userbot = None
     if Config.SESSION_STRING:
         userbot = TelegramClient(
             StringSession(Config.SESSION_STRING),
-            Config.API_ID,
-            Config.API_HASH,
+            Config.API_ID, Config.API_HASH,
         )
-        ok = await _start_with_floodwait(userbot, "Userbot")
-        if ok:
+        if await _safe_start(userbot, "Userbot"):
             me = await userbot.get_me()
-            logger.info(
-                f"✅ Userbot connected as {me.first_name} (ID {me.id})"
-            )
+            logger.info(f"✅ Userbot: {me.first_name} (ID {me.id})")
         else:
-            logger.warning("⚠️  Userbot failed to connect — disabled")
             userbot = None
     else:
-        logger.warning(
-            "⚠️  No SESSION_STRING — userbot disabled. "
-            "Use /gensession to create one."
-        )
+        logger.warning("⚠️  No SESSION_STRING — use /gensession")
 
-    # ── 4. Bot ─────────────────────────────────────────────────
+    # 4 — Bot
     bot = TelegramClient("bot_session", Config.API_ID, Config.API_HASH)
-    ok = await _start_with_floodwait(bot, "Bot", bot_token=Config.BOT_TOKEN)
-    if not ok:
-        logger.error("❌ Bot failed to start. Exiting.")
+    if not await _safe_start(bot, "Bot", bot_token=Config.BOT_TOKEN):
+        logger.error("❌ Bot failed. Exiting.")
         await db.disconnect()
         return
-
     bot_me = await bot.get_me()
-    logger.info(f"✅ Bot connected as @{bot_me.username}")
+    logger.info(f"✅ Bot: @{bot_me.username}")
 
-    # ── 5. Register handlers ───────────────────────────────────
-    register_handlers(bot, userbot, db)
-
-    # ── 6. Start posting engine ────────────────────────────────
+    # 5 — Posting engine
     poster = None
     if userbot:
         poster = PostingEngine(userbot, db)
         await poster.start()
 
-    logger.info("🟢 Bot is fully running")
+    # 6 — Handlers (receives poster reference for pause/resume)
+    register_handlers(bot, userbot, db, poster)
 
-    # ── 7. Keep alive until disconnected ───────────────────────
+    logger.info("🟢 Fully running")
+
+    # 7 — Block
     try:
         await bot.run_until_disconnected()
     finally:
@@ -109,7 +92,7 @@ async def main():
         if userbot:
             await userbot.disconnect()
         await db.disconnect()
-        logger.info("🛑 Bot shut down")
+        logger.info("🛑 Shut down")
 
 
 if __name__ == "__main__":
